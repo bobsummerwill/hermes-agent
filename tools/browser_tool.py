@@ -77,7 +77,9 @@ from tools.browser_providers.browser_use import BrowserUseProvider
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services)
-_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Include Apple Silicon Homebrew default prefixes so Node/npm-installed browser tooling
+# still works when Hermes is launched from launchd or other stripped environments.
+_SANE_PATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
