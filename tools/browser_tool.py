@@ -53,6 +53,7 @@ import atexit
 import json
 import logging
 import os
+import platform
 import re
 import signal
 import subprocess
@@ -64,6 +65,7 @@ import time
 import requests
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+from functools import lru_cache
 from agent.auxiliary_client import call_llm
 
 try:
@@ -77,7 +79,11 @@ from tools.browser_providers.browser_use import BrowserUseProvider
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services)
-_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Keep platform-specific so we do not inject Apple Silicon-only paths on Linux.
+if sys.platform == "darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+    _SANE_PATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+else:
+    _SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
@@ -579,39 +585,59 @@ def _get_session_name(task_id: Optional[str] = None) -> str:
     return session_info["session_name"]
 
 
+@lru_cache(maxsize=1)
 def _find_agent_browser() -> str:
     """
     Find the agent-browser CLI executable.
-    
-    Checks in order: PATH, local node_modules/.bin/, npx fallback.
-    
+
+    Checks candidate directories using the same sane PATH we inject at runtime,
+    then falls back to repo-local node_modules/.bin and finally `npx agent-browser`.
+    This avoids resolving against launchd's stripped parent PATH before we have a
+    chance to repair it for browser subprocesses.
+
     Returns:
-        Path to agent-browser executable
-        
+        Path to agent-browser executable or "npx agent-browser"
+
     Raises:
         FileNotFoundError: If agent-browser is not installed
     """
 
-    # Check if it's in PATH (global install)
+    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    candidate_dirs = [str(hermes_home / "node" / "bin")] + [p for p in _SANE_PATH.split(":") if p]
+
+    for directory in candidate_dirs:
+        if not directory or not os.path.isdir(directory):
+            continue
+        candidate = os.path.join(directory, "agent-browser")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    # Check current PATH too, in case caller already has a richer environment.
     which_result = shutil.which("agent-browser")
     if which_result:
         return which_result
-    
+
     # Check local node_modules/.bin/ (npm install in repo root)
     repo_root = Path(__file__).parent.parent
     local_bin = repo_root / "node_modules" / ".bin" / "agent-browser"
-    if local_bin.exists():
+    if local_bin.exists() and os.access(local_bin, os.X_OK):
         return str(local_bin)
-    
-    # Check common npx locations
+
+    for directory in candidate_dirs:
+        if not directory or not os.path.isdir(directory):
+            continue
+        npx_candidate = os.path.join(directory, "npx")
+        if os.path.isfile(npx_candidate) and os.access(npx_candidate, os.X_OK):
+            return f"{npx_candidate} agent-browser"
+
     npx_path = shutil.which("npx")
     if npx_path:
-        return "npx agent-browser"
-    
+        return f"{npx_path} agent-browser"
+
     raise FileNotFoundError(
         "agent-browser CLI not found. Install it with: npm install -g agent-browser\n"
         "Or run 'npm install' in the repo root to install locally.\n"
-        "Or ensure npx is available in your PATH."
+        "Or ensure npx is available in the Hermes/browser PATH."
     )
 
 
