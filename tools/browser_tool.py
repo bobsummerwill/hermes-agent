@@ -77,7 +77,12 @@ from tools.browser_providers.browser_use import BrowserUseProvider
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services)
-_SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Add Apple Silicon Homebrew paths only on macOS arm64, where launchd commonly
+# omits /opt/homebrew/bin and browser tooling depends on Homebrew-installed Node.
+if sys.platform == "darwin" and platform.machine() == "arm64":
+    _SANE_PATH = "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+else:
+    _SANE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Throttle screenshot cleanup to avoid repeated full directory scans.
 _last_screenshot_cleanup_by_dir: dict[str, float] = {}
