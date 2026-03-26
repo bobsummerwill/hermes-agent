@@ -23,6 +23,15 @@ if command -v gh &>/dev/null && gh auth status &>/dev/null 2>&1; then
     GH_USER=$(gh api user --jq '.login' 2>/dev/null)
 elif [ -n "$GITHUB_TOKEN" ]; then
     GH_AUTH_METHOD="curl"
+elif [ -n "$GITHUB_APP_ID" ] && [ -n "$GITHUB_APP_PRIVATE_KEY_PATH" ]; then
+    # GitHub App — generate installation token via helper script
+    _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _APP_TOKEN=$(python3 "$_SCRIPT_DIR/gh-app-token.py" 2>/dev/null)
+    if [ -n "$_APP_TOKEN" ] && [ ${#_APP_TOKEN} -gt 10 ]; then
+        GITHUB_TOKEN="$_APP_TOKEN"
+        GH_AUTH_METHOD="github-app"
+    fi
+    unset _APP_TOKEN _SCRIPT_DIR
 elif [ -f "$HOME/.git-credentials" ] && grep -q "github.com" "$HOME/.git-credentials" 2>/dev/null; then
     GITHUB_TOKEN=$(grep "github.com" "$HOME/.git-credentials" | head -1 | sed 's|https://[^:]*:\([^@]*\)@.*|\1|')
     if [ -n "$GITHUB_TOKEN" ]; then
