@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -747,6 +747,112 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    @staticmethod
+    def _is_thread_not_found_error(error: Exception) -> bool:
+        """Return True when Telegram rejects an invalid forum topic/thread target."""
+        return "thread not found" in str(error).lower()
+
+    @staticmethod
+    def _is_reply_target_missing_error(error: Exception) -> bool:
+        """Return True when Telegram rejects a reply target that no longer exists."""
+        return "message to be replied not found" in str(error).lower()
+
+    async def _call_telegram_with_retries(
+        self,
+        send_callable: Callable[..., Awaitable[Any]],
+        *,
+        request_kwargs: Dict[str, Any],
+        reply_to: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        include_reply_to: bool = True,
+        include_thread: bool = True,
+        log_label: str = "send",
+    ) -> Any:
+        """Call a Telegram bot method with thread/reply fallbacks and retry handling."""
+        try:
+            from telegram.error import NetworkError as _NetErr
+        except ImportError:
+            _NetErr = OSError  # type: ignore[misc,assignment]
+
+        try:
+            from telegram.error import BadRequest as _BadReq
+        except ImportError:
+            _BadReq = None  # type: ignore[assignment,misc]
+
+        try:
+            from telegram.error import TimedOut as _TimedOut
+        except (ImportError, AttributeError):
+            _TimedOut = None  # type: ignore[assignment,misc]
+
+        effective_reply_to_id = int(reply_to) if include_reply_to and reply_to else None
+        effective_thread_id = int(thread_id) if include_thread and thread_id else None
+
+        for _send_attempt in range(3):
+            call_kwargs = dict(request_kwargs)
+            if include_reply_to:
+                call_kwargs["reply_to_message_id"] = effective_reply_to_id
+            if include_thread:
+                call_kwargs["message_thread_id"] = effective_thread_id
+
+            try:
+                return await send_callable(**call_kwargs)
+            except Exception as send_err:
+                if effective_thread_id is not None and self._is_thread_not_found_error(send_err):
+                    logger.warning(
+                        "[%s] Thread %s not found during %s, retrying without message_thread_id",
+                        self.name,
+                        effective_thread_id,
+                        log_label,
+                    )
+                    effective_thread_id = None
+                    continue
+
+                if effective_reply_to_id is not None and self._is_reply_target_missing_error(send_err):
+                    logger.warning(
+                        "[%s] Reply target deleted during %s, retrying without reply_to: %s",
+                        self.name,
+                        log_label,
+                        send_err,
+                    )
+                    effective_reply_to_id = None
+                    continue
+
+                retry_after = getattr(send_err, "retry_after", None)
+                if retry_after is not None or "retry after" in str(send_err).lower():
+                    if _send_attempt < 2:
+                        wait = float(retry_after) if retry_after is not None else 1.0
+                        logger.warning(
+                            "[%s] Telegram flood control during %s (attempt %d/3), retrying in %.1fs: %s",
+                            self.name,
+                            log_label,
+                            _send_attempt + 1,
+                            wait,
+                            send_err,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                    raise
+
+                if _TimedOut and isinstance(send_err, _TimedOut):
+                    raise
+
+                if isinstance(send_err, _NetErr):
+                    if _BadReq and isinstance(send_err, _BadReq):
+                        raise
+                    if _send_attempt < 2:
+                        wait = 2 ** _send_attempt
+                        logger.warning(
+                            "[%s] Network error during %s (attempt %d/3), retrying in %ds: %s",
+                            self.name,
+                            log_label,
+                            _send_attempt + 1,
+                            wait,
+                            send_err,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+                raise
+
     async def send(
         self,
         chat_id: str,
@@ -777,110 +883,38 @@ class TelegramAdapter(BasePlatformAdapter):
             
             message_ids = []
             thread_id = metadata.get("thread_id") if metadata else None
-            
-            try:
-                from telegram.error import NetworkError as _NetErr
-            except ImportError:
-                _NetErr = OSError  # type: ignore[misc,assignment]
-
-            try:
-                from telegram.error import BadRequest as _BadReq
-            except ImportError:
-                _BadReq = None  # type: ignore[assignment,misc]
-
-            try:
-                from telegram.error import TimedOut as _TimedOut
-            except (ImportError, AttributeError):
-                _TimedOut = None  # type: ignore[assignment,misc]
 
             for i, chunk in enumerate(chunks):
                 should_thread = self._should_thread_reply(reply_to, i)
-                reply_to_id = int(reply_to) if should_thread else None
-                effective_thread_id = int(thread_id) if thread_id else None
 
-                msg = None
-                for _send_attempt in range(3):
+                async def _send_chunk(**call_kwargs):
                     try:
-                        # Try Markdown first, fall back to plain text if it fails
-                        try:
-                            msg = await self._bot.send_message(
+                        return await self._bot.send_message(
+                            chat_id=int(chat_id),
+                            text=chunk,
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            **call_kwargs,
+                        )
+                    except Exception as md_error:
+                        # Markdown parsing failed, try plain text
+                        if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                            logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+                            plain_chunk = _strip_mdv2(chunk)
+                            return await self._bot.send_message(
                                 chat_id=int(chat_id),
-                                text=chunk,
-                                parse_mode=ParseMode.MARKDOWN_V2,
-                                reply_to_message_id=reply_to_id,
-                                message_thread_id=effective_thread_id,
+                                text=plain_chunk,
+                                parse_mode=None,
+                                **call_kwargs,
                             )
-                        except Exception as md_error:
-                            # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                                plain_chunk = _strip_mdv2(chunk)
-                                msg = await self._bot.send_message(
-                                    chat_id=int(chat_id),
-                                    text=plain_chunk,
-                                    parse_mode=None,
-                                    reply_to_message_id=reply_to_id,
-                                    message_thread_id=effective_thread_id,
-                                )
-                            else:
-                                raise
-                        break  # success
-                    except _NetErr as send_err:
-                        # BadRequest is a subclass of NetworkError in
-                        # python-telegram-bot but represents permanent errors
-                        # (not transient network issues). Detect and handle
-                        # specific cases instead of blindly retrying.
-                        if _BadReq and isinstance(send_err, _BadReq):
-                            err_lower = str(send_err).lower()
-                            if "thread not found" in err_lower and effective_thread_id is not None:
-                                # Thread doesn't exist — retry without
-                                # message_thread_id so the message still
-                                # reaches the chat.
-                                logger.warning(
-                                    "[%s] Thread %s not found, retrying without message_thread_id",
-                                    self.name, effective_thread_id,
-                                )
-                                effective_thread_id = None
-                                continue
-                            if "message to be replied not found" in err_lower and reply_to_id is not None:
-                                # Original message was deleted before we
-                                # could reply — clear reply target and retry
-                                # so the response is still delivered.
-                                logger.warning(
-                                    "[%s] Reply target deleted, retrying without reply_to: %s",
-                                    self.name, send_err,
-                                )
-                                reply_to_id = None
-                                continue
-                            # Other BadRequest errors are permanent — don't retry
-                            raise
-                        # TimedOut is also a subclass of NetworkError but
-                        # indicates the request may have reached the server —
-                        # retrying risks duplicate message delivery.
-                        if _TimedOut and isinstance(send_err, _TimedOut):
-                            raise
-                        if _send_attempt < 2:
-                            wait = 2 ** _send_attempt
-                            logger.warning("[%s] Network error on send (attempt %d/3), retrying in %ds: %s",
-                                           self.name, _send_attempt + 1, wait, send_err)
-                            await asyncio.sleep(wait)
-                        else:
-                            raise
-                    except Exception as send_err:
-                        retry_after = getattr(send_err, "retry_after", None)
-                        if retry_after is not None or "retry after" in str(send_err).lower():
-                            if _send_attempt < 2:
-                                wait = float(retry_after) if retry_after is not None else 1.0
-                                logger.warning(
-                                    "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
-                                    self.name,
-                                    _send_attempt + 1,
-                                    wait,
-                                    send_err,
-                                )
-                                await asyncio.sleep(wait)
-                                continue
                         raise
+
+                msg = await self._call_telegram_with_retries(
+                    _send_chunk,
+                    request_kwargs={},
+                    reply_to=reply_to if should_thread else None,
+                    thread_id=thread_id,
+                    log_label="send_message",
+                )
                 message_ids.append(str(msg.message_id))
             
             return SendResult(
@@ -1126,12 +1160,17 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             thread_id = metadata.get("thread_id") if metadata else None
-            msg = await self._bot.send_message(
-                chat_id=int(chat_id),
-                text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard,
-                message_thread_id=int(thread_id) if thread_id else None,
+            msg = await self._call_telegram_with_retries(
+                self._bot.send_message,
+                request_kwargs={
+                    "chat_id": int(chat_id),
+                    "text": text,
+                    "parse_mode": ParseMode.MARKDOWN,
+                    "reply_markup": keyboard,
+                },
+                thread_id=thread_id,
+                include_reply_to=False,
+                log_label="send_model_picker",
             )
 
             # Store picker state keyed by chat_id
@@ -1487,22 +1526,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 # .ogg files -> send as voice (round playable bubble)
                 if audio_path.endswith((".ogg", ".opus")):
                     _voice_thread = metadata.get("thread_id") if metadata else None
-                    msg = await self._bot.send_voice(
-                        chat_id=int(chat_id),
-                        voice=audio_file,
-                        caption=caption[:1024] if caption else None,
-                        reply_to_message_id=int(reply_to) if reply_to else None,
-                        message_thread_id=int(_voice_thread) if _voice_thread else None,
+                    msg = await self._call_telegram_with_retries(
+                        self._bot.send_voice,
+                        request_kwargs={
+                            "chat_id": int(chat_id),
+                            "voice": audio_file,
+                            "caption": caption[:1024] if caption else None,
+                        },
+                        reply_to=reply_to,
+                        thread_id=_voice_thread,
+                        log_label="send_voice",
                     )
                 else:
                     # .mp3 and others -> send as audio file
                     _audio_thread = metadata.get("thread_id") if metadata else None
-                    msg = await self._bot.send_audio(
-                        chat_id=int(chat_id),
-                        audio=audio_file,
-                        caption=caption[:1024] if caption else None,
-                        reply_to_message_id=int(reply_to) if reply_to else None,
-                        message_thread_id=int(_audio_thread) if _audio_thread else None,
+                    msg = await self._call_telegram_with_retries(
+                        self._bot.send_audio,
+                        request_kwargs={
+                            "chat_id": int(chat_id),
+                            "audio": audio_file,
+                            "caption": caption[:1024] if caption else None,
+                        },
+                        reply_to=reply_to,
+                        thread_id=_audio_thread,
+                        log_label="send_audio",
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1534,12 +1581,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
             _thread = metadata.get("thread_id") if metadata else None
             with open(image_path, "rb") as image_file:
-                msg = await self._bot.send_photo(
-                    chat_id=int(chat_id),
-                    photo=image_file,
-                    caption=caption[:1024] if caption else None,
-                    reply_to_message_id=int(reply_to) if reply_to else None,
-                    message_thread_id=int(_thread) if _thread else None,
+                msg = await self._call_telegram_with_retries(
+                    self._bot.send_photo,
+                    request_kwargs={
+                        "chat_id": int(chat_id),
+                        "photo": image_file,
+                        "caption": caption[:1024] if caption else None,
+                    },
+                    reply_to=reply_to,
+                    thread_id=_thread,
+                    log_label="send_photo",
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1573,13 +1624,17 @@ class TelegramAdapter(BasePlatformAdapter):
             _thread = metadata.get("thread_id") if metadata else None
 
             with open(file_path, "rb") as f:
-                msg = await self._bot.send_document(
-                    chat_id=int(chat_id),
-                    document=f,
-                    filename=display_name,
-                    caption=caption[:1024] if caption else None,
-                    reply_to_message_id=int(reply_to) if reply_to else None,
-                    message_thread_id=int(_thread) if _thread else None,
+                msg = await self._call_telegram_with_retries(
+                    self._bot.send_document,
+                    request_kwargs={
+                        "chat_id": int(chat_id),
+                        "document": f,
+                        "filename": display_name,
+                        "caption": caption[:1024] if caption else None,
+                    },
+                    reply_to=reply_to,
+                    thread_id=_thread,
+                    log_label="send_document",
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1605,12 +1660,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
             _thread = metadata.get("thread_id") if metadata else None
             with open(video_path, "rb") as f:
-                msg = await self._bot.send_video(
-                    chat_id=int(chat_id),
-                    video=f,
-                    caption=caption[:1024] if caption else None,
-                    reply_to_message_id=int(reply_to) if reply_to else None,
-                    message_thread_id=int(_thread) if _thread else None,
+                msg = await self._call_telegram_with_retries(
+                    self._bot.send_video,
+                    request_kwargs={
+                        "chat_id": int(chat_id),
+                        "video": f,
+                        "caption": caption[:1024] if caption else None,
+                    },
+                    reply_to=reply_to,
+                    thread_id=_thread,
+                    log_label="send_video",
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1641,12 +1700,16 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Telegram can send photos directly from URLs (up to ~5MB)
             _photo_thread = metadata.get("thread_id") if metadata else None
-            msg = await self._bot.send_photo(
-                chat_id=int(chat_id),
-                photo=image_url,
-                caption=caption[:1024] if caption else None,  # Telegram caption limit
-                reply_to_message_id=int(reply_to) if reply_to else None,
-                message_thread_id=int(_photo_thread) if _photo_thread else None,
+            msg = await self._call_telegram_with_retries(
+                self._bot.send_photo,
+                request_kwargs={
+                    "chat_id": int(chat_id),
+                    "photo": image_url,
+                    "caption": caption[:1024] if caption else None,
+                },
+                reply_to=reply_to,
+                thread_id=_photo_thread,
+                log_label="send_photo_url",
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1664,11 +1727,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     resp.raise_for_status()
                     image_data = resp.content
                 
-                msg = await self._bot.send_photo(
-                    chat_id=int(chat_id),
-                    photo=image_data,
-                    caption=caption[:1024] if caption else None,
-                    reply_to_message_id=int(reply_to) if reply_to else None,
+                msg = await self._call_telegram_with_retries(
+                    self._bot.send_photo,
+                    request_kwargs={
+                        "chat_id": int(chat_id),
+                        "photo": image_data,
+                        "caption": caption[:1024] if caption else None,
+                    },
+                    reply_to=reply_to,
+                    log_label="send_photo_upload",
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
@@ -1695,12 +1762,16 @@ class TelegramAdapter(BasePlatformAdapter):
         
         try:
             _anim_thread = metadata.get("thread_id") if metadata else None
-            msg = await self._bot.send_animation(
-                chat_id=int(chat_id),
-                animation=animation_url,
-                caption=caption[:1024] if caption else None,
-                reply_to_message_id=int(reply_to) if reply_to else None,
-                message_thread_id=int(_anim_thread) if _anim_thread else None,
+            msg = await self._call_telegram_with_retries(
+                self._bot.send_animation,
+                request_kwargs={
+                    "chat_id": int(chat_id),
+                    "animation": animation_url,
+                    "caption": caption[:1024] if caption else None,
+                },
+                reply_to=reply_to,
+                thread_id=_anim_thread,
+                log_label="send_animation",
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1718,10 +1789,15 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._bot:
             try:
                 _typing_thread = metadata.get("thread_id") if metadata else None
-                await self._bot.send_chat_action(
-                    chat_id=int(chat_id),
-                    action="typing",
-                    message_thread_id=int(_typing_thread) if _typing_thread else None,
+                await self._call_telegram_with_retries(
+                    self._bot.send_chat_action,
+                    request_kwargs={
+                        "chat_id": int(chat_id),
+                        "action": "typing",
+                    },
+                    thread_id=_typing_thread,
+                    include_reply_to=False,
+                    log_label="send_chat_action",
                 )
             except Exception as e:
                 # Typing failures are non-fatal; log at debug level only.
