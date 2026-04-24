@@ -210,6 +210,34 @@ async def test_send_retries_without_thread_on_thread_not_found():
 
 
 @pytest.mark.asyncio
+async def test_send_retries_without_thread_for_generic_thread_error():
+    """Fallback should not depend on the exact Telegram exception subclass."""
+    adapter = _make_adapter()
+
+    call_log = []
+
+    async def mock_send_message(**kwargs):
+        call_log.append(dict(kwargs))
+        if kwargs.get("message_thread_id") is not None:
+            raise Exception("Message thread not found")
+        return SimpleNamespace(message_id=77)
+
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+
+    result = await adapter.send(
+        chat_id="123",
+        content="test message",
+        metadata={"thread_id": "99999"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "77"
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 99999
+    assert call_log[1]["message_thread_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_send_raises_on_other_bad_request():
     """Non-thread BadRequest errors should NOT be retried — they fail immediately."""
     adapter = _make_adapter()
@@ -355,3 +383,25 @@ async def test_send_retries_retry_after_errors():
     assert result.success is True
     assert result.message_id == "300"
     assert attempt[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_send_typing_retries_without_thread():
+    """Typing indicators should clear an invalid thread instead of silently stalling."""
+    adapter = _make_adapter()
+
+    call_log = []
+
+    async def mock_send_chat_action(**kwargs):
+        call_log.append(dict(kwargs))
+        if kwargs.get("message_thread_id") is not None:
+            raise Exception("Message thread not found")
+        return None
+
+    adapter._bot = SimpleNamespace(send_chat_action=mock_send_chat_action)
+
+    await adapter.send_typing("123", metadata={"thread_id": "99999"})
+
+    assert len(call_log) == 2
+    assert call_log[0]["message_thread_id"] == 99999
+    assert call_log[1].get("message_thread_id") is None
